@@ -1,13 +1,15 @@
 extern crate iron;
 extern crate hyper;
 extern crate bodyparser;
-extern crate serde_json;
+extern crate rustc_serialize;
 
-use hyper::Client;
+use rustc_serialize::json::Json;
+use hyper::{Url,Client};
 use iron::prelude::*;
 use iron::status;
-use iron::response::BodyReader;
+use iron::response::{BodyReader,WriteBody};
 use iron::{Handler};
+use iron::modifier::Modifier;
 use std::io::Read;
 
 struct ImageHandler {
@@ -17,6 +19,29 @@ struct ImageHandler {
 impl ImageHandler {
     fn new() -> Self {
         return ImageHandler { client: Client::new() };
+    }
+
+    fn fetch_image_from_content(&self, response: &mut hyper::client::Response, path: &str) -> Option<BodyReader<hyper::client::Response>> {
+        match Json::from_reader(response) {
+            Ok(json) => get_image_uri(json, path).and_then(|uri| self.fetch_image(&uri)),
+            Err(_) => None
+        }
+    }
+
+    fn fetch_image(&self, uri: &str) -> Option<BodyReader<hyper::client::Response>> {
+        let url = match Url::parse(uri) {
+            Ok(url) => url,
+            Err(_) => return None
+        };
+        let host = match url.host_str() {
+            Some(hostname) => hostname,
+            None => return None
+        };
+        let imageDataUrl = format!("http://localhost:8080/ace/file/{}/{}/{}", url.scheme(), host, url.path());
+        match self.client.get(&imageDataUrl).send() {
+            Ok(response) => return Some(BodyReader(response)),
+            Err(_) => return None
+        }
     }
 }
 
@@ -35,6 +60,11 @@ impl ContentImageInfo {
     }
 }
 
+
+fn get_image_uri(json: Json, path: &str) -> Option<String> {
+    return json.find_path(&["aspects","atex.Files","data","files", path, "fileUri"]).and_then(Json::as_string).map(str::to_owned)
+}
+
 impl Handler for ImageHandler {
     fn handle(&self, req: &mut Request) -> IronResult<Response> {
         let parsed = ContentImageInfo::from_path(&req.url.path[..]);
@@ -42,7 +72,12 @@ impl Handler for ImageHandler {
             None => return Ok(Response::with(status::BadRequest)),
             Some(info) => {
                 match self.client.get(&format!("{}/{}", "http://localhost:8080/ace/content/contentid", &info.content_id)).send() {
-                    Ok(response) => return Ok(Response::with((status::Ok, BodyReader(response)))),
+                    Ok(mut response) => {
+                        match self.fetch_image_from_content(&mut response, &info.path) {
+                            Some(body) => return Ok(Response::with((status::Ok, body))),
+                            None => return Ok(Response::with(status::InternalServerError))
+                        }
+                    }
                     Err(err) => return Ok(Response::with(status::NotFound))
                 }
             }
