@@ -1,16 +1,22 @@
 extern crate iron;
+extern crate hyper;
+extern crate bodyparser;
+extern crate serde_json;
 
+use hyper::Client;
 use iron::prelude::*;
 use iron::status;
+use iron::response::BodyReader;
 use iron::{Handler};
-
+use std::io::Read;
 
 struct ImageHandler {
+    client: Client
 }
 
 impl ImageHandler {
     fn new() -> Self {
-        return ImageHandler {};
+        return ImageHandler { client: Client::new() };
     }
 }
 
@@ -34,7 +40,12 @@ impl Handler for ImageHandler {
         let parsed = ContentImageInfo::from_path(&req.url.path[..]);
         match parsed {
             None => return Ok(Response::with(status::BadRequest)),
-            Some(info) => return Ok(Response::with((status::Ok, info.content_id + "/" + info.path.as_str())))
+            Some(info) => {
+                match self.client.get(&format!("{}/{}", "http://localhost:8080/ace/content/contentid", &info.content_id)).send() {
+                    Ok(response) => return Ok(Response::with((status::Ok, BodyReader(response)))),
+                    Err(err) => return Ok(Response::with(status::NotFound))
+                }
+            }
         }
     }
 }
