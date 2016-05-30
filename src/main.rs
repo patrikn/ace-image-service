@@ -1,16 +1,44 @@
-extern crate iron;
+#[macro_use] extern crate iron;
 extern crate hyper;
 extern crate bodyparser;
 extern crate rustc_serialize;
+extern crate urlencoded;
+mod params;
 
 use rustc_serialize::json::Json;
 use hyper::{Url,Client};
 use iron::prelude::*;
 use iron::status;
-use iron::response::{BodyReader,WriteBody};
 use iron::{Handler};
 use iron::modifier::Modifier;
-use std::io::Read;
+use std::fmt;
+use std::fs::File;
+use std::io;
+use params::ImageTransformation;
+use std::error::Error;
+
+#[derive(Debug)]
+struct InternalError {
+    desc: String
+}
+
+impl InternalError {
+    fn new(s: &str) -> InternalError {
+        InternalError { desc: s.to_owned() }
+    }
+}
+
+impl std::error::Error for InternalError {
+    fn description(&self) -> &str {
+        &self.desc
+    }
+}
+
+impl fmt::Display for InternalError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Internal error: {}", self.desc)
+    }
+}
 
 struct ImageHandler {
     client: Client
@@ -21,26 +49,38 @@ impl ImageHandler {
         return ImageHandler { client: Client::new() };
     }
 
-    fn fetch_image_from_content(&self, response: &mut hyper::client::Response, path: &str) -> Option<BodyReader<hyper::client::Response>> {
+    fn fetch_image_from_content(&self, response: &mut hyper::client::Response, path: &str) -> IronResult<hyper::client::Response> {
         match Json::from_reader(response) {
-            Ok(json) => get_image_uri(json, path).and_then(|uri| self.fetch_image(&uri)),
-            Err(_) => None
+            Ok(json) =>
+                get_image_uri(json, path)
+                .ok_or(IronError::new(io::Error::new(io::ErrorKind::NotFound, "No URI for image found"),
+                                      status::NotFound))
+                .and_then(|uri| self.fetch_image(&uri)),
+            Err(e) => Err(IronError::new(e, status::InternalServerError))
         }
     }
 
-    fn fetch_image(&self, uri: &str) -> Option<BodyReader<hyper::client::Response>> {
-        let url = match Url::parse(uri) {
-            Ok(url) => url,
-            Err(_) => return None
-        };
+    fn fetch_image<'a>(&self, uri: &str) -> IronResult<hyper::client::Response> {
+        let url = itry!(Url::parse(uri), (status::InternalServerError,
+                                          format!("Invalid image URI: {}", uri)));
         let host = match url.host_str() {
             Some(hostname) => hostname,
-            None => return None
+            None => return {
+                let msg = format!("Image URI has no host: {}", uri);
+                Err(IronError::new(InternalError::new(&msg), (status::InternalServerError,
+                                                              msg)))
+            }
         };
-        let imageDataUrl = format!("http://localhost:8080/ace/file/{}/{}/{}", url.scheme(), host, url.path());
-        match self.client.get(&imageDataUrl).send() {
-            Ok(response) => return Some(BodyReader(response)),
-            Err(_) => return None
+        let image_data_url = format!("http://localhost:8080/ace/file/{}/{}/{}", url.scheme(), host, url.path());
+        let r = self.client.get(&image_data_url).send();
+        match r {
+            Ok(response) => {
+                return Ok(response);
+            },
+            Err(e) => { let msg = format!("Couldn't fetch image: {}", 
+                                                     e.description());
+                        Err(IronError::new(e, (status::NotFound, msg)))
+            }
         }
     }
 }
@@ -60,25 +100,53 @@ impl ContentImageInfo {
     }
 }
 
+struct ImageReader {
+    file: String
+}
+
+impl ImageReader {
+    fn new(f: &str) -> ImageReader {
+        ImageReader { file: f.to_owned() }
+    }
+}
+
+impl Modifier<Response> for ImageReader {
+    fn modify(self, res: &mut iron::response::Response) {
+        File::open(&self.file).expect(&format!("Temp file not found: {}", &self.file)).modify(res)
+    }
+}
 
 fn get_image_uri(json: Json, path: &str) -> Option<String> {
     return json.find_path(&["aspects","atex.Files","data","files", path, "fileUri"]).and_then(Json::as_string).map(str::to_owned)
 }
 
+fn transform_image(img: &mut io::Read, _: Option<ImageTransformation>) -> IronResult<Response> {
+    let filename = "/tmp/img";
+    let mut out = match File::create(filename) {
+        Ok(f) => f,
+        Err(x) => return Err(IronError::new(x, status::InternalServerError))
+    };
+    io::copy(img, &mut out)
+        .map_err(|e| IronError::new(e, status::InternalServerError))
+        .and(Ok(Response::with((status::Ok, ImageReader::new(filename)))))
+}
+
 impl Handler for ImageHandler {
     fn handle(&self, req: &mut Request) -> IronResult<Response> {
+        let transform = try!(ImageTransformation::from_request(req));
         let parsed = ContentImageInfo::from_path(&req.url.path[..]);
         match parsed {
             None => return Ok(Response::with(status::BadRequest)),
             Some(info) => {
                 match self.client.get(&format!("{}/{}", "http://localhost:8080/ace/content/contentid", &info.content_id)).send() {
                     Ok(mut response) => {
-                        match self.fetch_image_from_content(&mut response, &info.path) {
-                            Some(body) => return Ok(Response::with((status::Ok, body))),
-                            None => return Ok(Response::with(status::InternalServerError))
+                        let img = self.fetch_image_from_content(&mut response, &info.path);
+                        match img {
+                            Ok(mut img) => transform_image(&mut img, transform),
+                            Err(e) => Err(e)
                         }
                     }
-                    Err(err) => return Ok(Response::with(status::NotFound))
+                    Err(_) => Ok(Response::with(status::NotFound))
                 }
             }
         }
