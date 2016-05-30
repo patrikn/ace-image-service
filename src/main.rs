@@ -16,6 +16,7 @@ use std::fs::File;
 use std::io;
 use params::ImageTransformation;
 use std::error::Error;
+use std::process::Command;
 
 #[derive(Debug)]
 struct InternalError {
@@ -77,8 +78,8 @@ impl ImageHandler {
             Ok(response) => {
                 return Ok(response);
             },
-            Err(e) => { let msg = format!("Couldn't fetch image: {}", 
-                                                     e.description());
+            Err(e) => { let msg = format!("Couldn't fetch image: {}",
+                                          e.description());
                         Err(IronError::new(e, (status::NotFound, msg)))
             }
         }
@@ -120,15 +121,35 @@ fn get_image_uri(json: Json, path: &str) -> Option<String> {
     return json.find_path(&["aspects","atex.Files","data","files", path, "fileUri"]).and_then(Json::as_string).map(str::to_owned)
 }
 
-fn transform_image(img: &mut io::Read, _: Option<ImageTransformation>) -> IronResult<Response> {
+fn transform_image(img: &mut io::Read, transform: Option<ImageTransformation>) -> IronResult<Response> {
     let filename = "/tmp/img";
     let mut out = match File::create(filename) {
         Ok(f) => f,
         Err(x) => return Err(IronError::new(x, status::InternalServerError))
     };
-    io::copy(img, &mut out)
+    let q: IronResult<&str> = io::copy(img, &mut out)
         .map_err(|e| IronError::new(e, status::InternalServerError))
-        .and(Ok(Response::with((status::Ok, ImageReader::new(filename)))))
+        .and_then(|_| {
+            let r: IronResult<&str> = transform
+                .map_or(
+                    Ok("/tmp/img"),
+                    |t| {
+                    let s: Result<std::process::ExitStatus, IronError> = Command::new("/usr/local/bin/gm")
+                        .arg("convert")
+                        .arg("-geometry")
+                        .arg(format!("{}x{}", t.width, t.height))
+                        .arg("/tmp/img")
+                        .arg("/tmp/scaled_img")
+                        .status()
+                        .map_err(|e| IronError::new(e, status::InternalServerError));
+                    s.and_then(|s| if s.success() {
+                        Ok("/tmp/scaled_img")
+                    } else {
+                        Err(IronError::new(InternalError::new("Image transformation failed"), status::InternalServerError))
+                    })
+                    });
+            r});
+    q.and(Ok(Response::with((status::Ok, ImageReader::new("/tmp/scaled_img")))))
 }
 
 impl Handler for ImageHandler {
